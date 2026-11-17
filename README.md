@@ -6,12 +6,16 @@ are replaced online — without dropping accepted inference and without ever
 running a third model process.
 
 ```
-POST /infer           classify a feature vector (with optional client timeout)
-POST /admin/models    upload weights/bias/labels and hot-swap the model in
-GET  /admin/versions  version registry
-GET  /admin/status    active version, in-flight counts, per-process state
-GET  /healthz         liveness
-GET  /docs            Swagger UI (interactive; shows every field)
+POST /infer                 classify a feature vector (with optional client timeout)
+                            optional device_id applies that device's calibration
+POST /admin/models          upload weights/bias/labels and hot-swap the model in
+POST /admin/calibrations    trial a per-device calibration; publish only if every
+                            reference sample is classified correctly
+GET  /admin/calibrations    calibration revision history (per device)
+GET  /admin/versions        version registry + calibrations
+GET  /admin/status          active version, in-flight counts, per-process state
+GET  /healthz               liveness
+GET  /docs                  Swagger UI (interactive; shows every field)
 ```
 
 ## Running it
@@ -66,6 +70,74 @@ else is rejected with 422 before a process is started.
 | `slow_load_ms` | demo: delay worker readiness to watch the old version serve |
 | `simulate_load_failure` | demo: make the new worker report a load failure |
 
+## Device calibration
+
+When a QC station's sensor is replaced, channel order and range change, so raw
+readings no longer mean what the model version was trained on. A calibration
+revision records, for one device and one model version:
+
+```
+calibrated[i] = raw[channel_permutation[i]] * gain[i] + offset[i]
+```
+
+`channel_permutation` must be a permutation of `0..n-1`; `gain`/`offset` may be
+one scalar or one value per channel. Omitted fields mean identity / gain 1 /
+offset 0.
+
+```bash
+curl -X POST http://localhost:8000/admin/calibrations -H 'content-type: application/json' -d '{
+  "device_id": "line-3-station-a",
+  "model_version": "v3",
+  "channel_permutation": [1, 0, 2, 3],
+  "gain": [2.0, 1.0, 1.0, 0.5],
+  "offset": [-1.0, 0.0, 0.0, 0.1],
+  "samples": [
+    {"features": [0.6, 0.85, 0.1, 0.8], "expected_label": "pass"},
+    {"features": [0.8, 0.55, 0.2, 0.6], "expected_label": "scratch"}
+  ]
+}'
+```
+
+With that mapping the first raw sample becomes model features
+`[0.85*2-1, 0.6, 0.1, (0.8-0.1)/0.5] = [0.7, 0.6, 0.1, 0.8]` before scoring.
+
+The trial runs **every** reference sample through the given version's model
+process. If all expected labels match, a new revision is published (201) and
+returned with per-sample scores; if any sample is wrong, nothing is written,
+the previous revision (if any) stays in force, and the response is
+`422 calibration_validation_failed` with the full trial result.
+
+`POST /infer` with `"device_id": "line-3-station-a"` transforms the raw
+features with that device's revision before scoring and returns
+`calibration_revision` and `calibrated_features`. Requests without `device_id`
+are completely unchanged (raw features straight to the model, `null` revision).
+
+Rules that keep calibration and model swapping from interfering:
+
+* A calibration is bound to the active **version and its exact parameter
+  fingerprint**. After a model swap, or after a failed version id is retried
+  with different weights, the old revision no longer applies. Device-tagged
+  inference then returns `409 calibration_required` until the new version is
+  calibrated; untagged inference keeps working on the new version.
+* A device request is pinned to version + revision at admission, in the same
+  lock that increments the in-flight counter. A revision published or a swap
+  committed immediately afterwards cannot change an accepted request, and a
+  slow accepted request still keeps its old version's slot until it finishes.
+* A trial is pinned to the version/fingerprint read at admission too.
+  Publication re-checks both under the lock: if a swap committed or the
+  parameters changed while the trial ran, publication fails with
+  `409 calibration_stale` and no revision is written. Old-version trial
+  results can never become a new-version calibration.
+* Trial inference is counted as in-flight model work, so a draining process
+  is not stopped mid-trial.
+* Revisions are numbered monotonically per device (across model versions) and
+  persisted to `$DATA_DIR/calibrations.json`; they are reloaded on restart
+  together with the promoted artifact. `GET /admin/calibrations` and
+  `/admin/status` show whether the latest revision still applies to the active
+  version.
+
+`examples/models` plus `python examples/demo.py` exercise the whole flow.
+
 ## The guarantees and how they are enforced
 
 Each version runs in **its own OS process** (`python -m app.worker_launcher`,
@@ -115,6 +187,16 @@ Two fixed slots, `slot-0` and `slot-1`, are the two-process budget.
 * **Crashed workers are reclaimed.** If a worker dies unexpectedly, its slot
   is released and, if it was active, the service reports 503 (no active model)
   rather than routing to a dead process.
+* **Calibrations are bound to parameters, not just version ids.** The promoted
+  version's exact weights/bias/labels are fingerprinted (`model_fingerprint`).
+  A calibration revision only applies while both the version id and that
+  fingerprint match the active version, so retrying a failed id with different
+  weights, or swapping in a new version, requires a fresh trial.
+* **A trial interleaving with a swap cannot publish stale results.** The trial
+  pins version+fingerprint at admission; publication re-validates them under
+  the registry lock. A concurrent swap makes publication fail with 409 and
+  leaves the old revision in force. Accepted slow inference keeps using the
+  version + revision it was admitted with and still drains normally.
 
 ## Demo scenarios
 
@@ -129,8 +211,12 @@ Two fixed slots, `slot-0` and `slot-1`, are the two-process budget.
    becomes active and the slow version goes `draining`. A third upload returns
    429 while the slow computation still runs. After it finishes the slot is
    released and the upload succeeds.
+4. **Device calibration.** See the section above: calibrate a device, infer
+   with its raw readings, submit a trial with a wrong label (422, revision
+   kept), swap the model (409 `calibration_required` on device traffic),
+   recalibrate and infer again.
 
-`python examples/demo.py <base-url>` runs all three end to end.
+`python examples/demo.py <base-url>` runs all of these end to end.
 
 ## Observations from the smoke runs
 
@@ -145,14 +231,16 @@ Two fixed slots, `slot-0` and `slot-1`, are the two-process budget.
 
 ```
 app/
-  main.py             API, swap orchestration, drain loop, status
+  main.py             API, swap orchestration, calibration trial/publish, drain loop, status
   process_manager.py  shared registry/state machine + worker process handles
-  worker.py           per-versionHTTP server (one process per version)
+  calibration.py      permutation/gain/offset validation + raw->model transform
+  worker.py           per-version HTTP server (one process per version)
   worker_launcher.py  process entry point: load artifact, bind, serve, handshake
-  models.py           artifact validation, NumPy scoring
+  models.py           artifact validation, NumPy scoring, parameter fingerprint
 tests/
   test_models.py          artifact validation + scoring
-  test_registry.py        state machine, claims, drain gate, crash reclaim
+  test_calibration.py     calibration validation + transform
+  test_registry.py        state machine, claims, drain gate, crash reclaim, calibration pinning
   test_api_integration.py real API + real worker processes
 examples/
   demo.py, models/*.json
@@ -162,7 +250,7 @@ examples/
 
 | env var | default | meaning |
 | --- | --- | --- |
-| `DATA_DIR` | `/data` | models, staging, worker control dirs, instance lock |
+| `DATA_DIR` | `/data` | models, staging, worker control dirs, `calibrations.json`, instance lock |
 | `DEFAULT_INFER_TIMEOUT_MS` | `5000` | client wait when `timeout_ms` is omitted |
 | `SWAP_WAIT_SECONDS` | `3` | how long an upload waits for a draining slot before 429 |
 | `SHUTDOWN_GRACE_SECONDS` | `20` | how long shutdown waits for in-flight work |

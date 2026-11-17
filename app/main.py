@@ -4,6 +4,9 @@ Public surface (see ``/docs``):
 
 * ``POST /infer``            -- classify a feature vector with a client timeout
 * ``POST /admin/models``     -- upload a classifier artifact and hot-swap it in
+* ``POST /admin/calibrations`` -- trial a per-device channel calibration on the
+  current model version and publish it only if every reference sample passes
+* ``GET  /admin/calibrations`` -- calibration revisions per device
 * ``GET  /admin/versions``   -- version registry
 * ``GET  /admin/status``     -- active version, in-flight counts, process states
 * ``GET  /healthz``          -- liveness
@@ -13,12 +16,16 @@ version runs in its own OS process, at most two such processes exist at once,
 requests are pinned to the version active at admission, and a retired version
 only releases its slot once every inference it actually accepted has finished
 inside its worker -- regardless of whether the client is still waiting.
+
+A device-tagged inference is additionally pinned to the calibration revision
+that matched the active version *and* its exact model parameters at admission.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import multiprocessing
 import os
@@ -27,12 +34,13 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field, field_validator
 
+from app.calibration import CalibrationInvalid, CalibrationTransform
 from app.models import ModelValidationError, load_model, save_artifact, validate_artifact
 from app.process_manager import (
     STATE_DRAINING,
@@ -41,6 +49,8 @@ from app.process_manager import (
     VERSION_FAILED,
     VERSION_LOADING,
     VERSION_RETIRED,
+    CalibrationConflict,
+    CalibrationRequired,
     FeatureMismatch,
     NoActiveModel,
     NoCapacity,
@@ -56,10 +66,13 @@ logging.basicConfig(
 )
 
 VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+# Device ids appear in URLs and are persisted; keep them to a safe alphabet.
+DEVICE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$")
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 MODEL_DIR = DATA_DIR / "models"
 STAGING_DIR = DATA_DIR / "staging"
 WORK_DIR = DATA_DIR / "workers"
+CALIBRATION_PATH = DATA_DIR / "calibrations.json"
 DEFAULT_TIMEOUT_MS = int(os.environ.get("DEFAULT_INFER_TIMEOUT_MS", "5000"))
 MAX_TIMEOUT_MS = 600_000
 # How long an upload may wait for a draining slot to be released before 429.
@@ -75,6 +88,15 @@ SHUTDOWN_GRACE_SECONDS = float(os.environ.get("SHUTDOWN_GRACE_SECONDS", "20"))
 
 class InferRequest(BaseModel):
     features: List[float] = Field(..., description="Feature vector for the classifier")
+    device_id: Optional[str] = Field(
+        None,
+        description=(
+            "Optional QC station id. When present, traffic is accepted only if the "
+            "active model version has a published calibration for this device; the "
+            "raw features are transformed by that revision before scoring. Without "
+            "it the request behaves exactly as before (no calibration)."
+        ),
+    )
     timeout_ms: Optional[int] = Field(
         None,
         ge=1,
@@ -111,6 +133,17 @@ class InferRequest(BaseModel):
             raise ValueError("features must contain at least one value")
         return value
 
+    @field_validator("device_id")
+    @classmethod
+    def _device_valid(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return value
+        if not DEVICE_RE.match(value):
+            raise ValueError(
+                "device_id must match ^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$"
+            )
+        return value
+
 
 class InferResponse(BaseModel):
     version: str
@@ -118,6 +151,136 @@ class InferResponse(BaseModel):
     score: float
     inference_id: str
     elapsed_ms: float
+    device_id: Optional[str] = Field(
+        None, description="Echo of the request's device id (None when omitted)"
+    )
+    calibration_revision: Optional[int] = Field(
+        None,
+        description=(
+            "Calibration revision used to transform the raw features, pinned at "
+            "admission. Null for requests without a device id."
+        ),
+    )
+    calibrated_features: Optional[List[float]] = Field(
+        None,
+        description="The transformed feature vector actually scored (device requests only)",
+    )
+
+
+class ReferenceSample(BaseModel):
+    features: List[float] = Field(
+        ..., description="Raw, uncalibrated channel readings from the device"
+    )
+    expected_label: str = Field(..., description="Ground-truth label for this sample")
+
+    @field_validator("features")
+    @classmethod
+    def _sample_features_present(cls, value: List[float]) -> List[float]:
+        if not value:
+            raise ValueError("sample features must contain at least one value")
+        return value
+
+
+class CalibrationRequest(BaseModel):
+    device_id: str = Field(..., description="QC station / sensor unit id")
+    model_version: str = Field(
+        ...,
+        description=(
+            "Model version the calibration is trialled against. Must be the "
+            "currently active version; the revision is only published for that "
+            "version and its exact parameters."
+        ),
+    )
+    channel_permutation: Optional[List[int]] = Field(
+        None,
+        description=(
+            "Order of raw channels as the model expects them: calibrated[i] = "
+            "raw[channel_permutation[i]]. Must be a permutation of 0..n-1; "
+            "defaults to identity."
+        ),
+    )
+    gain: Optional[Union[float, List[float]]] = Field(
+        None, description="Per-channel multiplier or one scalar for all channels; default 1"
+    )
+    offset: Optional[Union[float, List[float]]] = Field(
+        None, description="Per-channel additive bias or one scalar; default 0"
+    )
+    samples: List[ReferenceSample] = Field(
+        ...,
+        min_length=1,
+        description=(
+            "Reference samples with expected labels. ALL of them must be "
+            "classified correctly by the given version after calibration; "
+            "otherwise nothing is published and the previous revision stays valid."
+        ),
+    )
+    slow_sample_ms: int = Field(
+        0,
+        ge=0,
+        le=600_000,
+        description=(
+            "Demo hook: slow each trial inference down by this many ms, to observe "
+            "a calibration trial interleaving with a model swap."
+        ),
+    )
+
+    @field_validator("device_id")
+    @classmethod
+    def _device_valid(cls, value: str) -> str:
+        if not DEVICE_RE.match(value):
+            raise ValueError(
+                "device_id must match ^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$"
+            )
+        return value
+
+
+class SampleResult(BaseModel):
+    index: int
+    expected_label: str
+    actual_label: str
+    score: float
+    correct: bool
+
+
+class CalibrationTrialView(BaseModel):
+    version: str
+    device_id: str
+    calibration_revision: Optional[int] = Field(
+        None, description="Revision used for this trial (existing one, or null)"
+    )
+    all_correct: bool
+    correct: int
+    total: int
+    sample_results: List[SampleResult]
+    calibrated_features: List[List[float]]
+
+
+class CalibrationPublishedView(BaseModel):
+    device_id: str
+    revision: int
+    model_version: str
+    model_fingerprint: str
+    published_at: float
+    supersedes: Optional[int]
+    transform: Dict[str, Any]
+    sample_count: int
+    trial: CalibrationTrialView
+
+
+class CalibrationRecordView(BaseModel):
+    device_id: str
+    revision: int
+    model_version: str
+    model_fingerprint: str
+    published_at: float
+    status: str
+    sample_count: int
+    supersedes: Optional[int]
+    transform: Dict[str, Any]
+    applicable: bool = Field(
+        ...,
+        description="True only if this revision matches the currently active version and weights",
+    )
 
 
 class TimeoutResponse(BaseModel):
@@ -174,6 +337,17 @@ class StatusView(BaseModel):
     capacity: int
     slots: List[SlotView]
     versions: List[Dict[str, Any]]
+    calibrated_devices: List[str] = Field(
+        default_factory=list,
+        description="Devices with at least one published calibration revision",
+    )
+    device_calibration_revisions: Dict[str, Dict[str, Any]] = Field(
+        default_factory=dict,
+        description=(
+            "Per device, the latest published revision and whether it applies to "
+            "the currently active version and parameters"
+        ),
+    )
 
 
 class SwapResult(BaseModel):
@@ -186,6 +360,14 @@ class SwapResult(BaseModel):
     activated_at: float
     test_label: str
     load_seconds: float
+    model_fingerprint: Optional[str] = Field(
+        None,
+        description=(
+            "Identity of the promoted parameters. Calibrations are bound to this "
+            "value; device inference needs a calibration matching the new version "
+            "and fingerprint."
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -204,6 +386,9 @@ class InferenceService:
         self._draining: set[str] = set()
         self._background: set[asyncio.Task] = set()
         self._swap_lock = asyncio.Lock()  # serialises swaps inside this process
+        # Serialises calibration trials/publications so revision numbers are
+        # assigned in the same order the trials were accepted.
+        self._calibration_lock = asyncio.Lock()
         self._lock_file: Any = None
 
     # -- lifecycle -------------------------------------------------------
@@ -225,6 +410,7 @@ class InferenceService:
             ) from exc
         self.manager = _new_manager()
         self.registry = Registry(self.manager)
+        self._load_calibrations()
         self.client = httpx.AsyncClient(
             timeout=httpx.Timeout(connect=5.0, read=None, write=None, pool=None),
             limits=httpx.Limits(max_connections=512, max_keepalive_connections=128),
@@ -286,6 +472,48 @@ class InferenceService:
     @staticmethod
     def _artifact_path(version: str) -> Path:
         return MODEL_DIR / f"{version}.json"
+
+    def _load_calibrations(self) -> None:
+        """Restore published calibration revisions from disk (best effort).
+
+        The registry lives in a manager process that dies with the API, so the
+        revision history is persisted next to the promoted model artifacts.
+        """
+        try:
+            with open(CALIBRATION_PATH, "r", encoding="utf-8") as fh:
+                doc = json.load(fh)
+        except FileNotFoundError:
+            return
+        except (OSError, json.JSONDecodeError):
+            logger.exception("could not read %s; starting with no calibrations", CALIBRATION_PATH)
+            return
+        devices = doc.get("devices") if isinstance(doc, dict) else None
+        if not isinstance(devices, dict):
+            return
+        restored: Dict[str, List[Dict[str, Any]]] = {}
+        for device_id, records in devices.items():
+            if isinstance(device_id, str) and isinstance(records, list):
+                restored[device_id] = [rec for rec in records if isinstance(rec, dict)]
+        self.registry.restore_calibrations(restored)
+        logger.info("restored calibrations for %d device(s)", len(restored))
+
+    def _persist_calibrations(self) -> None:
+        """Write the whole revision history; call with the calibration lock held."""
+        snapshot = self.registry.snapshot()["calibrations"]
+        tmp = CALIBRATION_PATH.with_suffix(f".json.tmp.{os.getpid()}")
+        try:
+            CALIBRATION_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump({"devices": snapshot}, fh, indent=2, sort_keys=True)
+            os.replace(tmp, CALIBRATION_PATH)
+        except OSError:
+            logger.exception("failed to persist calibrations to %s", CALIBRATION_PATH)
+            with contextlib.suppress(FileNotFoundError):
+                tmp.unlink()
+
+    @staticmethod
+    def _model_fingerprint_from_path(path: str, version: str) -> str:
+        return load_model(path, version=version).fingerprint()
 
     def _persist_artifact(self, version: str, source_path: str) -> None:
         """Copy the promoted artifact into the durable per-version location."""
@@ -469,6 +697,24 @@ class InferenceService:
                         int(ready["n_features"]),
                         int(ready.get("n_classes", 0)),
                     )
+                # Record exactly what this candidate loaded.  Calibrations are
+                # bound to this fingerprint, so a failed id retried with
+                # different weights can never inherit an earlier calibration.
+                try:
+                    fingerprint = self._model_fingerprint_from_path(
+                        handle.model_path, version
+                    )
+                except ModelValidationError as exc:  # pragma: no cover - worker loaded it
+                    await self._salvage_candidate(version, handle, str(exc))
+                    raise HTTPException(
+                        status_code=502,
+                        detail={
+                            "error": "candidate_load_failed",
+                            "message": str(exc),
+                            "fallback_version": self.registry.active_version(),
+                        },
+                    ) from exc
+                self.registry.set_fingerprint(version, fingerprint)
 
                 try:
                     test_body = await self._test_candidate(version, test_features)
@@ -526,6 +772,7 @@ class InferenceService:
                     activated_at=float(new_info["activated_at"]),
                     test_label=test_body["label"],
                     load_seconds=float(ready.get("load_seconds", 0.0)),
+                    model_fingerprint=new_info.get("fingerprint"),
                 )
             except HTTPException:
                 raise
@@ -542,6 +789,300 @@ class InferenceService:
                     elif slot_id is not None:
                         self.registry.fail_candidate(version, "swap aborted")
                 self.registry.end_swap(old_version, token)
+
+    # -- calibration -----------------------------------------------------
+    async def calibrate(
+        self, req: "CalibrationRequest"
+    ) -> "CalibrationPublishedView":
+        """Trial a device calibration on the current version, then publish it.
+
+        Ordering rules that make interleaving safe:
+
+        * The trial is bound to the version *and* parameter fingerprint read at
+          admission.  All sample inferences execute inside that version's model
+          process (counted in its in-flight work, so a draining process is not
+          stopped underneath them).
+        * Nothing is published unless **every** sample is classified with its
+          expected label.
+        * Publication re-checks the active version/fingerprint under the
+          registry lock.  If a model swap or a parameter change committed while
+          the trial ran, publication fails with 409 and the old revision stays
+          in force -- an old-version trial can never become a new-version
+          calibration.
+        """
+        # Admit the trial against the requested version in one atomic step: the
+        # version must be active right now, its fingerprint is pinned, and the
+        # whole trial is counted as in-flight model work (so a drain cannot
+        # stop the process underneath it).
+        trial_info = self.registry.begin_trial(req.model_version)
+        if trial_info is None:
+            active = self.registry.active_version()
+            if active is None:
+                raise HTTPException(
+                    status_code=503,
+                    detail={"error": "no_active_model", "message": "no model is active"},
+                )
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "calibration_version_mismatch",
+                    "message": (
+                        f"calibration names model_version {req.model_version!r}, but "
+                        f"the active version is {active!r}; calibrate against the "
+                        "version that will serve the device"
+                    ),
+                    "active_version": active,
+                },
+            )
+
+        version = req.model_version
+        fingerprint = trial_info.get("fingerprint")
+        handle = self.handles.get(version)
+        info = self.registry.version_info(version)
+        if (
+            not fingerprint
+            or handle is None
+            or info is None
+            or info.get("n_features") is None
+        ):
+            # An active version always has a worker, a shape and a fingerprint
+            # (recorded before its promotion).  If not, it is mid-teardown.
+            self.registry.end_trial(version)
+            raise HTTPException(
+                status_code=503,
+                detail={"error": "worker_missing", "message": f"worker for {version} is gone"},
+            )
+        n_features = int(info["n_features"])
+
+        try:
+            transform = CalibrationTransform.build(
+                n_features,
+                req.channel_permutation,
+                req.gain,
+                req.offset,
+            )
+        except CalibrationInvalid as exc:
+            self.registry.end_trial(version)
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error": "invalid_calibration",
+                    "message": str(exc),
+                    "model_version": version,
+                    "expected_features": n_features,
+                },
+            ) from exc
+
+        expected_width = transform.n_features
+        for index, sample in enumerate(req.samples):
+            if len(sample.features) != expected_width:
+                self.registry.end_trial(version)
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "error": "invalid_calibration",
+                        "message": (
+                            f"sample {index} has {len(sample.features)} raw features; "
+                            f"version {version!r} expects {expected_width}"
+                        ),
+                    },
+                )
+
+        # Transform every sample up front.  A NaN/infinite raw reading is a
+        # client error, detected before any model work is done.
+        calibrated: List[List[float]] = []
+        try:
+            calibrated = [transform.apply(s.features) for s in req.samples]
+        except CalibrationInvalid as exc:
+            self.registry.end_trial(version)
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error": "invalid_calibration",
+                    "message": f"reference samples are not usable: {exc}",
+                },
+            ) from exc
+
+        results: List[SampleResult] = []
+        worker_error: Optional[str] = None
+
+        async def _trial() -> None:
+            nonlocal worker_error
+            try:
+                await self._run_trial_samples(version, handle, req, calibrated, results)
+            except (RuntimeError, httpx.HTTPError) as exc:
+                worker_error = str(exc)
+            finally:
+                # The in-flight count must clear only when the model process is
+                # actually done, even if the calibration client disconnects.
+                self.registry.end_trial(version)
+
+        task = asyncio.create_task(_trial())
+        self._background.add(task)
+        task.add_done_callback(self._background.discard)
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            # The trial keeps running to completion against the pinned version;
+            # nothing is published for this (abandoned) request.
+            raise
+
+        if worker_error is not None:
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "error": "calibration_trial_failed",
+                    "message": worker_error,
+                    "model_version": version,
+                    "published": False,
+                },
+            )
+
+        all_correct = all(r.correct for r in results)
+        existing = self.registry.resolve_calibration(req.device_id, version, fingerprint)
+        trial = CalibrationTrialView(
+            version=version,
+            device_id=req.device_id,
+            calibration_revision=existing["revision"] if existing else None,
+            all_correct=all_correct,
+            correct=sum(1 for r in results if r.correct),
+            total=len(results),
+            sample_results=results,
+            calibrated_features=calibrated,
+        )
+        if not all_correct:
+            logger.warning(
+                "calibration for device %s on %s failed %d/%d sample(s); revision kept",
+                req.device_id,
+                version,
+                len(results) - trial.correct,
+                len(results),
+            )
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error": "calibration_validation_failed",
+                    "message": (
+                        f"{len(results) - trial.correct} of {len(results)} reference "
+                        "sample(s) were misclassified; nothing was published and the "
+                        "previous revision, if any, remains in force"
+                    ),
+                    "device_id": req.device_id,
+                    "model_version": version,
+                    "published": False,
+                    "trial": trial.model_dump(),
+                },
+            )
+
+        async with self._calibration_lock:
+            try:
+                record = self.registry.publish_calibration(
+                    device_id=req.device_id,
+                    model_version=version,
+                    model_fingerprint=fingerprint,
+                    transform_doc=transform.to_doc(),
+                    samples=[s.model_dump() for s in req.samples],
+                )
+            except CalibrationConflict as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "error": "calibration_stale",
+                        "message": str(exc),
+                        "active_version": self.registry.active_version(),
+                        "published": False,
+                    },
+                ) from exc
+            self._persist_calibrations()
+
+        logger.info(
+            "published calibration r%d for device %s on %s",
+            record["revision"],
+            req.device_id,
+            version,
+        )
+        return CalibrationPublishedView(
+            device_id=record["device_id"],
+            revision=int(record["revision"]),
+            model_version=record["model_version"],
+            model_fingerprint=record["model_fingerprint"],
+            published_at=float(record["published_at"]),
+            supersedes=record.get("supersedes"),
+            transform=record["transform"],
+            sample_count=int(record["sample_count"]),
+            trial=trial,
+        )
+
+    async def _run_trial_samples(
+        self,
+        version: str,
+        handle: WorkerHandle,
+        req: "CalibrationRequest",
+        calibrated: List[List[float]],
+        results: List["SampleResult"],
+    ) -> None:
+        """Score every calibrated reference sample in the pinned model process."""
+        assert self.client is not None
+        url = handle.inference_url()
+        for index, sample in enumerate(req.samples):
+            features = calibrated[index]
+            payload: Dict[str, Any] = {"features": features}
+            if req.slow_sample_ms:
+                payload["slow_ms"] = req.slow_sample_ms
+            resp = await self.client.post(
+                url, json=payload, timeout=httpx.Timeout(60.0)
+            )
+            if resp.status_code != 200:
+                raise RuntimeError(
+                    f"model process returned HTTP {resp.status_code} for sample "
+                    f"{index}: {resp.text[:300]}"
+                )
+            body = resp.json()
+            if body.get("version") != version:
+                raise RuntimeError(
+                    f"model process reported version {body.get('version')!r} while "
+                    f"trialling {version!r}"
+                )
+            actual = str(body.get("label"))
+            results.append(
+                SampleResult(
+                    index=index,
+                    expected_label=sample.expected_label,
+                    actual_label=actual,
+                    score=float(body.get("score", 0.0)),
+                    correct=actual == sample.expected_label,
+                )
+            )
+
+    def calibration_records(self, device_id: Optional[str]) -> List["CalibrationRecordView"]:
+        snapshot = self.registry.snapshot()
+        active = snapshot["active_version"]
+        active_info = snapshot["versions"].get(active) if active else None
+        active_fp = active_info.get("fingerprint") if active_info else None
+        records: List[CalibrationRecordView] = []
+        for dev, entries in snapshot["calibrations"].items():
+            if device_id is not None and dev != device_id:
+                continue
+            for rec in entries:
+                records.append(
+                    CalibrationRecordView(
+                        device_id=dev,
+                        revision=int(rec["revision"]),
+                        model_version=rec["model_version"],
+                        model_fingerprint=rec["model_fingerprint"],
+                        published_at=float(rec["published_at"]),
+                        status=str(rec.get("status", "published")),
+                        sample_count=int(rec["sample_count"]),
+                        supersedes=rec.get("supersedes"),
+                        transform=rec["transform"],
+                        applicable=(
+                            rec["model_version"] == active
+                            and rec["model_fingerprint"] == active_fp
+                        ),
+                    )
+                )
+        records.sort(key=lambda r: (r.device_id, r.revision))
+        return records
 
     # -- draining --------------------------------------------------------
     async def _drain_loop(self) -> None:
@@ -610,10 +1151,14 @@ class InferenceService:
 
     # -- inference -------------------------------------------------------
     async def infer(
-        self, features: List[float], timeout_ms: int, slow_ms: int = 0
+        self,
+        features: List[float],
+        timeout_ms: int,
+        slow_ms: int = 0,
+        device_id: Optional[str] = None,
     ) -> InferResponse:
         try:
-            version, _slot_id = self.registry.accept_work(len(features))
+            admission = self.registry.accept_inference(device_id, len(features))
         except FeatureMismatch as exc:
             raise HTTPException(
                 status_code=422,
@@ -625,11 +1170,48 @@ class InferenceService:
                     "received_features": len(features),
                 },
             ) from exc
+        except CalibrationRequired as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "calibration_required",
+                    "message": str(exc),
+                    "device_id": exc.device_id,
+                    "version": exc.version,
+                    "action": (
+                        "POST /admin/calibrations with this device_id and "
+                        f"model_version={exc.version!r}; inference without device_id "
+                        "continues on the uncalibrated model"
+                    ),
+                },
+            ) from exc
         except NoActiveModel as exc:
             raise HTTPException(
                 status_code=503,
                 detail={"error": "no_active_model", "message": str(exc)},
             ) from exc
+
+        version = admission.version
+        calibration = admission.calibration
+        calibrated_features: Optional[List[float]] = None
+        revision: Optional[int] = None
+        if calibration is not None:
+            transform = CalibrationTransform.from_doc(calibration["transform"])
+            try:
+                features = transform.apply(features)
+            except CalibrationInvalid as exc:  # pragma: no cover - validated at publish
+                self.registry.complete_work(version)
+                raise HTTPException(
+                    status_code=500,
+                    detail={
+                        "error": "calibration_corrupt",
+                        "message": str(exc),
+                        "version": version,
+                        "calibration_revision": calibration["revision"],
+                    },
+                ) from exc
+            calibrated_features = features
+            revision = int(calibration["revision"])
 
         handle = self.handles.get(version)
         if handle is None:  # pragma: no cover - registry/handle invariant
@@ -667,6 +1249,7 @@ class InferenceService:
                 detail={
                     "error": "inference_timeout",
                     "version": version,
+                    "calibration_revision": revision,
                     "timeout_ms": timeout_ms,
                     "elapsed_ms": round(elapsed, 3),
                     "note": (
@@ -698,6 +1281,9 @@ class InferenceService:
             score=float(result["score"]),
             inference_id=inference_id,
             elapsed_ms=round(elapsed, 3),
+            device_id=device_id,
+            calibration_revision=revision,
+            calibrated_features=calibrated_features,
         )
 
     async def _proxy_inference(
@@ -724,6 +1310,23 @@ class InferenceService:
         total_accepted = 0
         total_completed = 0
         active = snapshot["active_version"]
+        active_info = snapshot["versions"].get(active) if active else None
+        active_fp = active_info.get("fingerprint") if active_info else None
+        device_revisions: Dict[str, Dict[str, Any]] = {}
+        for device_id, records in snapshot["calibrations"].items():
+            if not records:
+                continue
+            latest = records[-1]
+            device_revisions[device_id] = {
+                "revision": int(latest["revision"]),
+                "model_version": latest["model_version"],
+                "published_at": float(latest["published_at"]),
+                "applicable": (
+                    latest["model_version"] == active
+                    and latest["model_fingerprint"] == active_fp
+                ),
+                "revision_count": len(records),
+            }
         for slot in snapshot["slots"]:
             handle = self.handles.get(slot["version"]) if slot["version"] else None
             alive = handle.alive() if handle is not None else None
@@ -754,6 +1357,8 @@ class InferenceService:
             versions=sorted(
                 snapshot["versions"].values(), key=lambda v: v.get("created_at", 0)
             ),
+            calibrated_devices=sorted(device_revisions),
+            device_calibration_revisions=device_revisions,
         )
 
 
@@ -790,7 +1395,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Edge QC Classifier Inference Service",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "Linear classifier inference with live model replacement on an edge QC "
         "machine that can host at most **two model processes**.\n\n"
@@ -798,13 +1403,29 @@ app = FastAPI(
         "version is loaded in a free process, smoke-tested, then promoted. The "
         "old version keeps serving during load and keeps serving if the new one "
         "fails.\n"
+        "* `POST /admin/calibrations` trials a per-device channel permutation / "
+        "gain / offset against the **currently active** version using reference "
+        "samples with expected labels. A new revision is published only if every "
+        "sample is classified correctly; otherwise nothing changes. A calibration "
+        "is bound to one device, one model version and that version's exact "
+        "parameters.\n"
         "* `POST /infer` returns the top-scoring label and the version. Requests "
-        "are pinned to the version active when accepted. `timeout_ms` (or "
-        "`timeout_seconds`) bounds the *client wait only*: on expiry you get 504 "
-        "while the worker keeps working and keeps its slot.\n"
+        "are pinned to the version active when accepted. With `device_id` the "
+        "request is also pinned to the calibration revision that matched the "
+        "active version at admission; without it, the request behaves exactly as "
+        "before. `timeout_ms` (or `timeout_seconds`) bounds the *client wait "
+        "only*: on expiry you get 504 while the worker keeps working and keeps "
+        "its slot.\n"
+        "* `GET /admin/calibrations` lists calibration revisions per device and "
+        "whether each still applies to the active version.\n"
         "* `GET /admin/status` shows the active version, in-flight counts and each "
         "process slot's state (`loading` / `active` / `draining` / `idle`).\n\n"
         "**Demos**\n"
+        "- Calibrate a device: `POST /admin/calibrations` with raw `samples` and "
+        "their `expected_label`s; then `POST /infer` with raw features and the "
+        "same `device_id`. Swap the model and the old revision stops applying: "
+        "device-tagged inference returns 409 `calibration_required` until the new "
+        "version is calibrated.\n"
         "- Slow inference: `POST /infer` with `slow_ms: 3000`, `timeout_ms: 200`, "
         "then watch `/admin/status` and try uploading another version: while the "
         "drained version still works, only one slot is free.\n"
@@ -831,11 +1452,17 @@ def healthz() -> Dict[str, Any]:
             "model": TimeoutResponse,
             "description": "Client timeout; the worker keeps computing and holds its slot.",
         },
+        409: {
+            "description": (
+                "device_id supplied but the active version has no matching "
+                "calibration (calibration_required)"
+            )
+        },
         503: {"description": "No active model"},
         502: {"description": "Worker unreachable or errored"},
     },
     tags=["inference"],
-    summary="Classify a feature vector",
+    summary="Classify a feature vector (optionally via a device calibration)",
 )
 async def infer(req: InferRequest) -> InferResponse:
     if req.timeout_ms is not None:
@@ -844,7 +1471,55 @@ async def infer(req: InferRequest) -> InferResponse:
         timeout_ms = max(1, int(round(req.timeout_seconds * 1000)))
     else:
         timeout_ms = DEFAULT_TIMEOUT_MS
-    return await service.infer(req.features, timeout_ms, req.slow_ms)
+    return await service.infer(
+        req.features, timeout_ms, req.slow_ms, device_id=req.device_id
+    )
+
+
+@app.post(
+    "/admin/calibrations",
+    response_model=CalibrationPublishedView,
+    status_code=201,
+    responses={
+        409: {
+            "description": (
+                "Calibration names a version that is no longer active, or the model "
+                "changed while the trial ran (nothing published)"
+            )
+        },
+        422: {
+            "description": (
+                "Invalid permutation/gain/offset, wrong sample width, or at least "
+                "one reference sample misclassified (nothing published)"
+            )
+        },
+        502: {"description": "The model process failed while trialling samples"},
+        503: {"description": "No active model"},
+    },
+    tags=["calibration"],
+    summary="Trial and publish a per-device channel calibration",
+)
+async def calibrate(payload: CalibrationRequest) -> CalibrationPublishedView:
+    if not VERSION_RE.match(payload.model_version):
+        raise HTTPException(
+            status_code=422,
+            detail="model_version must match ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$",
+        )
+    return await service.calibrate(payload)
+
+
+@app.get(
+    "/admin/calibrations",
+    response_model=List[CalibrationRecordView],
+    tags=["calibration"],
+    summary="Calibration revision history per device",
+)
+def list_calibrations(
+    device_id: Optional[str] = Query(
+        None, description="Only return revisions for this device"
+    ),
+) -> List[CalibrationRecordView]:
+    return service.calibration_records(device_id)
 
 
 @app.post(
@@ -911,6 +1586,10 @@ def versions() -> Dict[str, Any]:
         "versions": sorted(
             snapshot["versions"].values(), key=lambda v: v.get("created_at", 0)
         ),
+        "calibrations": {
+            device_id: [dict(rec) for rec in records]
+            for device_id, records in snapshot["calibrations"].items()
+        },
     }
 
 

@@ -30,9 +30,10 @@ def _free_port() -> int:
 
 
 class ApiServer:
-    def __init__(self, data_dir: Path) -> None:
+    def __init__(self, data_dir: Path, extra_env: dict | None = None) -> None:
         self.data_dir = data_dir
         self.port = _free_port()
+        self.extra_env = extra_env or {}
         self.proc: subprocess.Popen | None = None
         self.log = open(data_dir / "api.log", "w", encoding="utf-8")
 
@@ -41,7 +42,12 @@ class ApiServer:
         return f"http://127.0.0.1:{self.port}"
 
     def __enter__(self) -> "ApiServer":
-        env = {**os.environ, "DATA_DIR": str(self.data_dir), "LOG_LEVEL": "WARNING"}
+        env = {
+            **os.environ,
+            **self.extra_env,
+            "DATA_DIR": str(self.data_dir),
+            "LOG_LEVEL": "WARNING",
+        }
         self.proc = subprocess.Popen(
             [
                 sys.executable,
@@ -373,3 +379,405 @@ def test_12_no_model_after_shutdown(api):
     assert httpx.get(f"{api.base}/healthz", timeout=5).status_code == 200
     assert httpx.get(f"{api.base}/docs", timeout=5).status_code == 200
     assert httpx.get(f"{api.base}/openapi.json", timeout=5).status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# Device calibration
+# ---------------------------------------------------------------------------
+
+# A physically plausible station: raw channel 1 is a mirrored sensor with a
+# different scale, and raw channel 0 carries an offset.  The model wants
+# [ch1 * 2 - 5, ch0] (channel 0/1 swapped, gain, offset).
+CAL_DEVICE = "station-7"
+CAL_SWAP = [1, 0]
+CAL_GAIN = [2.0, 1.0]
+CAL_OFFSET = [-5.0, 0.0]
+
+
+def raw_of_model_features(a: float, b: float) -> list[float]:
+    """Inverse of the calibration above: model-space (a, b) -> raw channels."""
+    return [b, (a + 5.0) / 2.0]
+
+
+def label_for(api: ApiServer, a: float, b: float) -> str:
+    """Expected label for a model-space point, from the currently active model.
+
+    Deriving it from the untagged path keeps the calibration tests independent
+    of which weights the earlier swap tests left active.
+    """
+    resp = infer(api, [a, b])
+    assert resp.status_code == 200, resp.text
+    return resp.json()["label"]
+
+
+def default_samples(api: ApiServer) -> list[dict]:
+    return [
+        {
+            "features": raw_of_model_features(a, b),
+            "expected_label": label_for(api, a, b),
+        }
+        for a, b in ((0.9, 0.1), (0.1, 0.9))
+    ]
+
+
+def calibrate(api: ApiServer, **overrides):
+    payload = {
+        "device_id": CAL_DEVICE,
+        "model_version": status(api)["active_version"],
+        "channel_permutation": CAL_SWAP,
+        "gain": CAL_GAIN,
+        "offset": CAL_OFFSET,
+        "samples": default_samples(api),
+    }
+    payload.update(overrides)
+    return httpx.post(f"{api.base}/admin/calibrations", json=payload, timeout=60.0)
+
+
+def device_infer(api: ApiServer, raw_features, **extra):
+    body = {"features": raw_features, "device_id": CAL_DEVICE, **extra}
+    return httpx.post(f"{api.base}/infer", json=body, timeout=40.0)
+
+
+def test_20_calibrate_device_and_infer(api):
+    active = status(api)["active_version"]
+
+    # Without a calibration for the active version, device traffic is refused
+    # but untagged traffic keeps working.
+    resp = device_infer(api, [0.1, 0.545])
+    assert resp.status_code == 409, resp.text
+    detail = resp.json()["detail"]
+    assert detail["error"] == "calibration_required"
+    assert detail["device_id"] == CAL_DEVICE
+    assert detail["version"] == active
+    assert infer(api, [0.9, 0.1]).status_code == 200
+
+    trial = calibrate(api)
+    assert trial.status_code == 201, trial.text
+    published = trial.json()
+    assert published["revision"] == 1
+    assert published["model_version"] == active
+    assert published["supersedes"] is None
+    assert published["trial"]["all_correct"] is True
+    assert published["trial"]["total"] == 2
+    assert published["trial"]["calibrated_features"][0] == pytest.approx([0.9, 0.1])
+
+    # Raw device readings now score like the underlying model features.
+    resp = device_infer(api, raw_of_model_features(0.9, 0.1))
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["version"] == active
+    assert body["label"] == label_for(api, 0.9, 0.1)
+    assert body["calibration_revision"] == 1
+    assert body["device_id"] == CAL_DEVICE
+    assert body["calibrated_features"] == pytest.approx([0.9, 0.1])
+
+    # Untagged requests are unchanged: no revision, raw features go straight in.
+    plain = infer(api, [0.9, 0.1]).json()
+    assert plain["calibration_revision"] is None
+    assert plain["calibrated_features"] is None
+    assert plain["label"] == body["label"]
+    # The revision is listed and marked applicable.
+    listing = httpx.get(f"{api.base}/admin/calibrations", timeout=5).json()
+    ours = [r for r in listing if r["device_id"] == CAL_DEVICE]
+    assert ours[-1]["revision"] == 1
+    assert ours[-1]["applicable"] is True
+
+
+def test_21_failed_trial_keeps_previous_revision(api):
+    before = [
+        r
+        for r in httpx.get(f"{api.base}/admin/calibrations", timeout=5).json()
+        if r["device_id"] == CAL_DEVICE
+    ]
+    assert before[-1]["revision"] == 1
+
+    resp = calibrate(
+        api,
+        samples=[
+            {
+                "features": raw_of_model_features(0.9, 0.1),
+                "expected_label": label_for(api, 0.9, 0.1),
+            },
+            {
+                "features": raw_of_model_features(0.9, 0.1),
+                "expected_label": label_for(api, 0.1, 0.9),
+            },
+        ],
+    )
+    assert resp.status_code == 422, resp.text
+    detail = resp.json()["detail"]
+    assert detail["error"] == "calibration_validation_failed"
+    assert detail["published"] is False
+    assert detail["trial"]["correct"] == 1
+    assert detail["trial"]["total"] == 2
+
+    after = [
+        r
+        for r in httpx.get(f"{api.base}/admin/calibrations", timeout=5).json()
+        if r["device_id"] == CAL_DEVICE
+    ]
+    assert [r["revision"] for r in after] == [1]
+    # The old revision still serves.
+    resp = device_infer(api, raw_of_model_features(0.9, 0.1))
+    assert resp.status_code == 200
+    assert resp.json()["calibration_revision"] == 1
+
+
+def test_22_invalid_calibration_shapes_rejected(api):
+    bad_perm = calibrate(api, channel_permutation=[0, 0])
+    assert bad_perm.status_code == 422
+    assert bad_perm.json()["detail"]["error"] == "invalid_calibration"
+
+    bad_gain = calibrate(api, gain=[1.0, 2.0, 3.0])
+    assert bad_gain.status_code == 422
+    assert bad_gain.json()["detail"]["error"] == "invalid_calibration"
+
+    wrong_width = calibrate(
+        api, samples=[{"features": [0.1], "expected_label": "defect-A"}]
+    )
+    assert wrong_width.status_code == 422
+    assert wrong_width.json()["detail"]["error"] == "invalid_calibration"
+
+    wrong_version = calibrate(api, model_version="not-active")
+    assert wrong_version.status_code == 409
+    assert wrong_version.json()["detail"]["error"] == "calibration_version_mismatch"
+
+
+def test_23_new_version_requires_recalibration(api):
+    wait_for(lambda: status(api)["slots_in_use"] == 1, timeout=10)
+    old = status(api)["active_version"]
+    resp = upload(
+        api,
+        artifact(
+            f"cal-{uuid.uuid4().hex[:6]}",
+            W_A,
+            [0.0, 0.0],
+            LABELS,
+            expected_active_version=old,
+        ),
+    )
+    assert resp.status_code == 201, resp.text
+
+    # Old revision is retained in history but not applicable to the new version.
+    listing = [
+        r
+        for r in httpx.get(f"{api.base}/admin/calibrations", timeout=5).json()
+        if r["device_id"] == CAL_DEVICE
+    ]
+    assert listing[-1]["revision"] == 1
+    assert listing[-1]["applicable"] is False
+
+    refused = device_infer(api, raw_of_model_features(0.9, 0.1))
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["detail"]["error"] == "calibration_required"
+
+    # Untagged inference on the new version is unaffected.
+    assert infer(api, [0.9, 0.1]).json()["version"] == status(api)["active_version"]
+
+    republished = calibrate(api)
+    assert republished.status_code == 201, republished.text
+    body = republished.json()
+    assert body["revision"] == 2  # monotonic across model versions
+    assert body["supersedes"] == 1
+    served = device_infer(api, raw_of_model_features(0.9, 0.1)).json()
+    assert served["calibration_revision"] == 2
+
+
+def test_24_trial_racing_a_swap_cannot_publish_old_version(api):
+    wait_for(lambda: status(api)["slots_in_use"] == 1, timeout=10)
+    old = status(api)["active_version"]
+    earlier = [
+        r
+        for r in httpx.get(f"{api.base}/admin/calibrations", timeout=5).json()
+        if r["device_id"] == CAL_DEVICE
+    ][-1]["revision"]
+
+    import threading
+
+    result: dict = {}
+
+    def do_calibration():
+        # One sample, slowed to 2000ms, so the swap below definitely commits
+        # while the trial is still running on the old version.
+        result["cal"] = calibrate(
+            api,
+            model_version=old,
+            slow_sample_ms=2000,
+            samples=[
+                {
+                    "features": raw_of_model_features(0.9, 0.1),
+                    "expected_label": label_for(api, 0.9, 0.1),
+                }
+            ],
+        )
+
+    thread = threading.Thread(target=do_calibration)
+    thread.start()
+    time.sleep(0.4)
+    swap = upload(
+        api,
+        artifact(
+            f"race-{uuid.uuid4().hex[:6]}",
+            W_B,
+            [0.0, 0.0],
+            LABELS,
+            expected_active_version=old,
+        ),
+    )
+    assert swap.status_code == 201, swap.text
+    thread.join(timeout=60)
+    assert "cal" in result
+
+    cal_resp = result["cal"]
+    assert cal_resp.status_code == 409, cal_resp.text
+    detail = cal_resp.json()["detail"]
+    assert detail["error"] == "calibration_stale"
+    assert detail["published"] is False
+
+    # Nothing was published for the old trial; the new version stays
+    # uncalibrated and the revision counter did not advance.
+    listing = [
+        r
+        for r in httpx.get(f"{api.base}/admin/calibrations", timeout=5).json()
+        if r["device_id"] == CAL_DEVICE
+    ]
+    assert listing[-1]["revision"] == earlier
+    assert device_infer(api, raw_of_model_features(0.9, 0.1)).status_code == 409
+
+
+def test_25_accepted_inference_keeps_revision_and_completes_after_swap(api):
+    wait_for(lambda: status(api)["slots_in_use"] == 1, timeout=10)
+    republished = calibrate(api)
+    assert republished.status_code == 201, republished.text
+    revision = republished.json()["revision"]
+    active = status(api)["active_version"]
+
+    # Slow device inference accepted on `active` and its revision...
+    slow = device_infer(
+        api,
+        raw_of_model_features(0.7, 0.3),
+        slow_ms=6000,
+        timeout_ms=150,
+    )
+    assert slow.status_code == 504, slow.text
+    assert slow.json()["detail"]["calibration_revision"] == revision
+    st = status(api)
+    assert st["total_in_flight"] == 1
+
+    # ...then a swap commits and a new calibration revision is published for
+    # the new version.  Neither may disturb the accepted request.
+    new_version = f"pin-{uuid.uuid4().hex[:6]}"
+    swap = upload(
+        api,
+        artifact(new_version, W_A, [0.0, 0.0], LABELS, expected_active_version=active),
+    )
+    assert swap.status_code == 201, swap.text
+    assert status(api)["active_version"] == new_version
+
+    recal = calibrate(api)
+    assert recal.status_code == 201, recal.text
+    new_revision = recal.json()["revision"]
+    assert new_revision == revision + 1
+
+    # New device traffic uses the new revision / new version.
+    fresh = device_infer(api, raw_of_model_features(0.9, 0.1))
+    assert fresh.status_code == 200
+    assert fresh.json()["version"] == new_version
+    assert fresh.json()["calibration_revision"] == new_revision
+
+    # The slow request still holds the old version's slot until it finishes.
+    assert status(api)["total_in_flight"] == 1
+    wait_for(lambda: status(api)["slots_in_use"] == 1, timeout=15)
+
+
+def test_26_trial_does_not_break_two_process_cap(api):
+    wait_for(lambda: status(api)["slots_in_use"] == 1, timeout=10)
+    assert status(api)["slots_in_use"] == 1
+    resp = calibrate(
+        api,
+        samples=[
+            {
+                "features": raw_of_model_features(0.9, 0.1),
+                "expected_label": label_for(api, 0.9, 0.1),
+            }
+        ],
+    )
+    assert resp.status_code == 201, resp.text
+    st = status(api)
+    assert st["slots_in_use"] == 1
+    assert st["capacity"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Persistence and request validation
+# ---------------------------------------------------------------------------
+
+
+def test_27_calibrations_survive_restart(tmp_path):
+    """Published revisions are reloaded with the promoted model on restart."""
+    data_dir = tmp_path / "restart-data"
+    data_dir.mkdir()
+    with ApiServer(data_dir) as first:
+        boot = upload(
+            first,
+            artifact(
+                "boot",
+                W_A,
+                [0.0, 0.0],
+                LABELS,
+                test_features=[0.9, 0.1],
+            ),
+        )
+        assert boot.status_code == 201, boot.text
+        published = calibrate(first)
+        assert published.status_code == 201, published.text
+        assert published.json()["revision"] == 1
+        assert device_infer(first, raw_of_model_features(0.9, 0.1)).status_code == 200
+
+    # Restart against the same data directory, re-bootstrapping the promoted
+    # artifact exactly as docker-compose.yml documents.
+    boot_env = {
+        "BOOTSTRAP_VERSION": "boot",
+        "BOOTSTRAP_MODEL": str(data_dir / "models" / "boot.json"),
+    }
+    with ApiServer(data_dir, extra_env=boot_env) as second:
+        wait_for(lambda: status(second)["active_version"] == "boot", timeout=30)
+        listing = httpx.get(f"{second.base}/admin/calibrations", timeout=5).json()
+        ours = [r for r in listing if r["device_id"] == CAL_DEVICE]
+        assert ours and ours[-1]["revision"] == 1
+        assert ours[-1]["applicable"] is True
+        served = device_infer(second, raw_of_model_features(0.9, 0.1))
+        assert served.status_code == 200, served.text
+        assert served.json()["calibration_revision"] == 1
+        assert served.json()["version"] == "boot"
+
+
+def test_28_device_id_and_sample_validation(api):
+    wait_for(lambda: status(api)["slots_in_use"] == 1, timeout=10)
+    bad_device = httpx.post(
+        f"{api.base}/infer",
+        json={"features": [0.1, 0.2], "device_id": "bad device/../x"},
+        timeout=5,
+    )
+    assert bad_device.status_code == 422
+
+    no_samples = httpx.post(
+        f"{api.base}/admin/calibrations",
+        json={
+            "device_id": CAL_DEVICE,
+            "model_version": status(api)["active_version"],
+            "samples": [],
+        },
+        timeout=5,
+    )
+    assert no_samples.status_code == 422
+
+    no_device_cal = httpx.post(
+        f"{api.base}/admin/calibrations",
+        json={
+            "model_version": status(api)["active_version"],
+            "samples": [{"features": [0.1, 0.2], "expected_label": "x"}],
+        },
+        timeout=5,
+    )
+    assert no_device_cal.status_code == 422

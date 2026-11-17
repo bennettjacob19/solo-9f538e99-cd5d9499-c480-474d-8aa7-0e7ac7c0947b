@@ -77,3 +77,17 @@ def test_load_rejects_corrupt_file(tmp_path):
     path.write_text("{not json")
     with pytest.raises(ModelValidationError, match="not valid JSON"):
         load_model(str(path))
+
+
+def test_fingerprint_tracks_parameters_and_labels():
+    a = Model("v", np.array([[1.0, 0.0]]), np.array([0.0]), ["x"])
+    same = Model("other-id", np.array([[1.0, 0.0]]), np.array([0.0]), ["x"])
+    changed_weights = Model("v", np.array([[1.0, 0.5]]), np.array([0.0]), ["x"])
+    changed_bias = Model("v", np.array([[1.0, 0.0]]), np.array([0.1]), ["x"])
+    changed_labels = Model("v", np.array([[1.0, 0.0]]), np.array([0.0]), ["y"])
+
+    # The version string is not part of the identity; parameters are.
+    assert a.fingerprint() == same.fingerprint()
+    assert a.fingerprint() != changed_weights.fingerprint()
+    assert a.fingerprint() != changed_bias.fingerprint()
+    assert a.fingerprint() != changed_labels.fingerprint()

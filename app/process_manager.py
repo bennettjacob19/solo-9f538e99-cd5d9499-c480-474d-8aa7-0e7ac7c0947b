@@ -30,6 +30,15 @@ Rules encoded here:
   swap claiming the same old version while the first is still in progress is
   rejected before any process is started.  The API runs as a single process
   (enforced by a data-directory lock), so this one writer owns the budget.
+
+Device calibrations are keyed by ``(device_id, model_version,
+model_fingerprint)``.  ``accept_work`` therefore pins the *combination* of
+model version and calibration revision under the same lock that increments the
+in-flight counter: a calibration published or a model swap committed right
+afterward can never change what an already-accepted request computes with.
+A revision is published only for the version/fingerprint it was trialled
+against, so a calibration trialled on the old version is never applied to the
+new active version.
 """
 
 from __future__ import annotations
@@ -41,6 +50,7 @@ import subprocess
 import sys
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
@@ -71,6 +81,29 @@ class NoActiveModel(RuntimeError):
     """Inference was requested before any model became active."""
 
 
+class CalibrationRequired(RuntimeError):
+    """The request names a device whose active model version has no calibration."""
+
+    def __init__(self, message: str, device_id: str, version: str) -> None:
+        super().__init__(message)
+        self.device_id = device_id
+        self.version = version
+
+
+class CalibrationConflict(RuntimeError):
+    """The calibration trialled a model version/fingerprint that is no longer current."""
+
+
+@dataclass(frozen=True)
+class Admission:
+    """A request pinned to one model version and (optionally) calibration revision."""
+
+    version: str
+    slot_id: str
+    model_fingerprint: Optional[str]
+    calibration: Optional[Dict[str, Any]]
+
+
 class FeatureMismatch(ValueError):
     """The feature vector width does not match the active model."""
 
@@ -89,6 +122,7 @@ class Registry:
         self._versions = manager.dict()
         self._slots = manager.dict()
         self._claims = manager.dict()
+        self._calibrations = manager.dict()  # device_id -> list of revision records
         self._state = manager.dict({"active_version": None})
         now = time.time()
         for i in range(SLOT_COUNT):
@@ -122,6 +156,12 @@ class Registry:
                 "slots": [slots[k] for k in sorted(slots)],
                 "versions": versions,
                 "claims": dict(self._claims),
+                # Deep-ish copy: the revision records are plain dicts/lists so
+                # a shallow list copy is enough for callers that only read.
+                "calibrations": {
+                    device_id: [dict(rec) for rec in records]
+                    for device_id, records in self._calibrations.items()
+                },
             }
 
     def active_version(self) -> Optional[str]:
@@ -148,6 +188,89 @@ class Registry:
             return any(
                 s["process_state"] == STATE_IDLE for s in self._slots.values()
             )
+
+    # ------------------------------------------------------------------
+    # Device calibrations
+    # ------------------------------------------------------------------
+    def calibration_records(self, device_id: str) -> list[Dict[str, Any]]:
+        with self._lock:
+            return [dict(rec) for rec in self._calibrations.get(device_id, [])]
+
+    def resolve_calibration(
+        self, device_id: str, version: str, fingerprint: Optional[str]
+    ) -> Optional[Dict[str, Any]]:
+        """Return the latest revision for this exact model version + weights."""
+        with self._lock:
+            for record in reversed(self._calibrations.get(device_id, [])):
+                if record["model_version"] != version:
+                    continue
+                if record.get("model_fingerprint") != fingerprint:
+                    continue
+                return dict(record)
+            return None
+
+    def publish_calibration(
+        self,
+        device_id: str,
+        model_version: str,
+        model_fingerprint: str,
+        transform_doc: Dict[str, Any],
+        samples: list[Dict[str, Any]],
+        published_by: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Append a revision, but only if the trialled version is still current.
+
+        The trial ran outside the lock against the version and weights that
+        were active when it began.  Re-checking both here is what prevents a
+        concurrent model swap from turning an old-version trial result into a
+        calibration for the new version.
+        """
+        with self._lock:
+            active = self._state["active_version"]
+            if active != model_version:
+                raise CalibrationConflict(
+                    f"calibration was trialled against version {model_version!r}, "
+                    f"but the active version is now {active!r}; retry the trial "
+                    "against the current version"
+                )
+            info = self._versions.get(model_version)
+            if info is None or info["state"] != VERSION_ACTIVE:
+                raise CalibrationConflict(
+                    f"version {model_version!r} is no longer active"
+                )
+            if info.get("fingerprint") != model_fingerprint:
+                raise CalibrationConflict(
+                    "the model parameters changed while the calibration was being "
+                    "trialled; retry against the current model"
+                )
+            records = [dict(rec) for rec in self._calibrations.get(device_id, [])]
+            revision = max((int(r["revision"]) for r in records), default=0) + 1
+            record = {
+                "device_id": device_id,
+                "revision": revision,
+                "model_version": model_version,
+                "model_fingerprint": model_fingerprint,
+                "transform": dict(transform_doc),
+                "sample_count": len(samples),
+                "published_at": time.time(),
+                "published_by": published_by,
+                "status": "published",
+                "supersedes": revision - 1 if revision > 1 else None,
+            }
+            records.append(record)
+            self._calibrations[device_id] = records
+            return dict(record)
+
+    def latest_calibration_for_device(self, device_id: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            records = self._calibrations.get(device_id) or []
+            return dict(records[-1]) if records else None
+
+    def restore_calibrations(self, devices: Dict[str, list[Dict[str, Any]]]) -> None:
+        """Reload persisted revision history at startup (atomic w.r.t. admission)."""
+        with self._lock:
+            for device_id, records in devices.items():
+                self._calibrations[device_id] = [dict(rec) for rec in records]
 
     # ------------------------------------------------------------------
     # Admission / registration
@@ -245,6 +368,9 @@ class Registry:
                 "error": None,
                 "attempt": attempt,
                 "previous_error": previous_error,
+                "n_features": None,
+                "n_classes": None,
+                "fingerprint": None,
             }
             return slot_id
 
@@ -271,6 +397,20 @@ class Registry:
             info = dict(info)
             info["n_features"] = int(n_features)
             info["n_classes"] = int(n_classes)
+            self._versions[version] = info
+
+    def set_fingerprint(self, version: str, fingerprint: str) -> None:
+        """Record the exact parameter identity loaded by the worker.
+
+        ``swap_in_path`` keeps this in sync with what it smoke-tested; a
+        calibration revision is only usable while it matches.
+        """
+        with self._lock:
+            info = self._versions.get(version)
+            if info is None:
+                return
+            info = dict(info)
+            info["fingerprint"] = fingerprint
             self._versions[version] = info
 
     def mark_candidate_tested(self, version: str) -> None:
@@ -365,6 +505,29 @@ class Registry:
         version's input width inside the same critical section, so a rejected
         request never touches the in-flight counter.
         """
+        admission = self.accept_inference(None, n_features)
+        return admission.version, admission.slot_id
+
+    def accept_inference(
+        self,
+        device_id: Optional[str] = None,
+        n_features: Optional[int] = None,
+    ) -> Admission:
+        """Atomically pin model version + calibration revision to a request.
+
+        Everything a request depends on is read inside one critical section:
+
+        * the active version,
+        * that version's exact parameter fingerprint,
+        * the latest calibration revision for ``device_id`` **whose model
+          version and fingerprint match that active version**,
+
+        and the slot's in-flight counter is incremented before the lock is
+        released.  A model swap or a calibration publication that commits
+        afterwards therefore cannot affect this request.  A calibration that
+        was trialled against a different version or different weights is
+        invisible here rather than silently applied.
+        """
         with self._lock:
             version = self._state["active_version"]
             if version is None:
@@ -390,13 +553,80 @@ class Registry:
                 or slot["process_state"] != STATE_ACTIVE
             ):
                 raise NoActiveModel("active slot is inconsistent")
+
+            fingerprint = info.get("fingerprint")
+            calibration: Optional[Dict[str, Any]] = None
+            if device_id is not None:
+                for record in reversed(self._calibrations.get(device_id, [])):
+                    if (
+                        record["model_version"] == version
+                        and record.get("model_fingerprint") == fingerprint
+                    ):
+                        calibration = dict(record)
+                        break
+                if calibration is None:
+                    raise CalibrationRequired(
+                        f"device {device_id!r} has no calibration for active "
+                        f"version {version!r}; submit a calibration trial for this "
+                        "version before sending device-tagged inference",
+                        device_id=device_id,
+                        version=version,
+                    )
+
             slot = dict(slot)
             slot["in_flight"] += 1
             slot["accepted"] += 1
             self._slots[info["slot_id"]] = slot
-            return version, info["slot_id"]
+            return Admission(
+                version=version,
+                slot_id=info["slot_id"],
+                model_fingerprint=fingerprint,
+                calibration=calibration,
+            )
 
     def complete_work(self, version: str) -> None:
+        with self._lock:
+            info = self._versions.get(version)
+            if info is None:
+                return
+            slot = self._slots.get(info["slot_id"])
+            if slot is None or slot["version"] != version:
+                return
+            slot = dict(slot)
+            slot["in_flight"] = max(0, slot["in_flight"] - 1)
+            slot["completed"] += 1
+            self._slots[info["slot_id"]] = slot
+
+    def begin_trial(self, version: str) -> Optional[Dict[str, Any]]:
+        """Count an in-flight calibration trial against the version's slot.
+
+        Trials are real work executed inside the model process, so the drain
+        gate must see them exactly like inference.  Returns a snapshot of the
+        version (including its parameter fingerprint) when it is still the
+        active version, or ``None`` (without counting) otherwise.
+        """
+        with self._lock:
+            info = self._versions.get(version)
+            if (
+                self._state["active_version"] != version
+                or info is None
+                or info["state"] != VERSION_ACTIVE
+            ):
+                return None
+            slot = self._slots.get(info["slot_id"])
+            if (
+                slot is None
+                or slot["version"] != version
+                or slot["process_state"] != STATE_ACTIVE
+            ):
+                return None
+            slot = dict(slot)
+            slot["in_flight"] += 1
+            slot["accepted"] += 1
+            self._slots[info["slot_id"]] = slot
+            return dict(info)
+
+    def end_trial(self, version: str) -> None:
         with self._lock:
             info = self._versions.get(version)
             if info is None:

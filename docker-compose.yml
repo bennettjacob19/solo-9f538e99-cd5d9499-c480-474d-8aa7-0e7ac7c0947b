@@ -13,7 +13,9 @@ services:
       SWAP_WAIT_SECONDS: "3"
       SHUTDOWN_GRACE_SECONDS: "20"
       LOG_LEVEL: INFO
-      # Optional: load an existing artifact at startup.
+      # Optional: load an existing artifact at startup.  Published calibrations
+      # are restored automatically from /data/calibrations.json and re-apply
+      # when the bootstrapped version + parameters match.
       # BOOTSTRAP_VERSION: v1
       # BOOTSTRAP_MODEL: /data/models/v1.json
     volumes:

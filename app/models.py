@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import socket
@@ -38,6 +39,22 @@ class Model:
         scores = self.score(features)
         idx = int(np.argmax(scores))
         return self.labels[idx], float(scores[idx])
+
+    def fingerprint(self) -> str:
+        """Stable identity of the scored parameters.
+
+        Device calibrations are only valid for the exact weights/bias/labels
+        they were trialled against.  A retry of a failed version id may carry
+        different parameters, so calibrations store this fingerprint and an
+        admission only accepts a matching one.
+        """
+        digest = hashlib.sha256()
+        digest.update(np.ascontiguousarray(self.weights, dtype="<f8").tobytes())
+        digest.update(b"\x00")
+        digest.update(np.ascontiguousarray(self.bias, dtype="<f8").tobytes())
+        digest.update(b"\x00")
+        digest.update("\x1f".join(self.labels).encode("utf-8"))
+        return digest.hexdigest()
 
 
 def _as_matrix(value: Any, name: str) -> np.ndarray:
